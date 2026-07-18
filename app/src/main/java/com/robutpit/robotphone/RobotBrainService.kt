@@ -82,6 +82,16 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
     private val waypoints = mutableListOf<Pair<Double, Double>>()
     private var currentWpIndex = 0
     private var navRunningLocal = false
+    private var connectionStatus = "Подключение..."
+    private var lastGpsText = ""
+
+    private fun updateStatusDisplay() {
+        RobotBrainState.status.value = if (lastGpsText.isEmpty()) {
+            connectionStatus
+        } else {
+            "$connectionStatus\n$lastGpsText"
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -151,7 +161,8 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
     private fun startEverything(host: String) {
         if (running) return
         running = true
-        RobotBrainState.status.value = "Подключение к серверу..."
+        connectionStatus = "Подключение к серверу..."
+        updateStatusDisplay()
         connectWebSocket(host)
         startLocationUpdates()
         rotationSensor?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI) }
@@ -182,18 +193,21 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 val hello = JSONObject().put("type", "hello").put("role", "phone")
                 webSocket.send(hello.toString())
-                RobotBrainState.status.value = "Онлайн, шлём GPS/видео"
+                connectionStatus = "Онлайн, шлём GPS/видео"
+                updateStatusDisplay()
                 updateNotification("Онлайн")
             }
             override fun onMessage(webSocket: WebSocket, text: String) {
                 handleServerMessage(text)
             }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                RobotBrainState.status.value = "Ошибка соединения: ${t.message}"
+                connectionStatus = "ОШИБКА СОЕДИНЕНИЯ: ${t.message}"
+                updateStatusDisplay()
                 updateNotification("Ошибка соединения")
             }
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                RobotBrainState.status.value = "Соединение закрыто"
+                connectionStatus = "Соединение закрыто (код $code)"
+                updateStatusDisplay()
             }
         })
     }
@@ -350,6 +364,10 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
                     put("acc", loc.accuracy)
                 }
                 webSocket?.send(msg.toString())
+                lastGpsText = "GPS: %.6f, %.6f (\u00b1%.0fм)".format(
+                    loc.latitude, loc.longitude, loc.accuracy
+                )
+                if (!navRunningLocal) updateStatusDisplay()
             }
         }
         fusedLocation.requestLocationUpdates(request, locationCallback!!, Looper.getMainLooper())
