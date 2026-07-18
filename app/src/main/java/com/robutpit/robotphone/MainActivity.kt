@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.opengl.GLSurfaceView
 import android.os.Build
 import android.os.Bundle
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
@@ -50,6 +51,10 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
+        // Экран не должен гаснуть — иначе Android ставит Activity на паузу,
+        // а вместе с ней встаёт и ARCore (видео + объезд препятствий).
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         prefs = getSharedPreferences("robot_brain", MODE_PRIVATE)
         hostInput = findViewById(R.id.hostInput)
@@ -139,7 +144,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startBrain() {
-        val host = hostInput.text.toString().trim()
+        val rawHost = hostInput.text.toString().trim()
+        val host = rawHost
+            .removePrefix("https://")
+            .removePrefix("http://")
+            .trimEnd('/')
         val intent = Intent(this, RobotBrainService::class.java).apply {
             action = RobotBrainService.ACTION_START
             putExtra(RobotBrainService.EXTRA_HOST, host)
