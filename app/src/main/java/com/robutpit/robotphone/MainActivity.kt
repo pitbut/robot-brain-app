@@ -60,7 +60,7 @@ class MainActivity : AppCompatActivity() {
         hostInput = findViewById(R.id.hostInput)
         statusText = findViewById(R.id.statusText)
         hostInput.setText(
-            prefs.getString("host", "robot-platform-xxxx.onrender.com")
+            prefs.getString("host", "robot-platform-v2.onrender.com")
         )
 
         arSurfaceView = findViewById(R.id.arSurfaceView)
