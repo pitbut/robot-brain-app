@@ -505,6 +505,7 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
                     localServer?.sendToRobot(json) // ESP32 должна знать, что автопилот включён/выключен
                 }
                 "gimbal" -> localServer?.sendToRobot(json) // прокидываем ESP32 напрямую локально
+                "manual_drive" -> localServer?.sendToRobot(json) // ручное управление — тоже напрямую на ESP32
                 "listen_control" -> {
                     // Оператор включает/выключает "слушать робота" — экономим трафик,
                     // когда никто не слушает, микрофон вообще не стримит.
