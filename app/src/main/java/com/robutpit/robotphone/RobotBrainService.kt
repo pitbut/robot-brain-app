@@ -103,16 +103,26 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
     private var micJob: Job? = null
 
     private val waypoints = mutableListOf<Pair<Double, Double>>()
+    private val milestones = mutableListOf<Milestone>()
     private var currentWpIndex = 0
     private var navRunningLocal = false
     private var connectionStatus = "Подключение..."
     private var localServerInfo = ""
     private var lastGpsText = ""
+    private var currentTargetAddress = ""
+
+    private data class Milestone(val index: Int, val address: String)
 
     private fun updateStatusDisplay() {
+        val milestonesText = if (milestones.isNotEmpty()) {
+            "Точки маршрута:\n" + milestones.joinToString("\n") { "#${it.index + 1}: ${it.address}" }
+        } else null
+
         val parts = listOfNotNull(
             connectionStatus,
             localServerInfo.takeIf { it.isNotEmpty() },
+            currentTargetAddress.takeIf { it.isNotEmpty() }?.let { "Едет к: $it" },
+            milestonesText,
             lastGpsText.takeIf { it.isNotEmpty() },
         )
         RobotBrainState.status.value = parts.joinToString("\n")
@@ -444,11 +454,26 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
                         waypoints.add(p.getDouble("lat") to p.getDouble("lng"))
                     }
                     currentWpIndex = 0
+
+                    milestones.clear()
+                    if (json.has("milestones")) {
+                        val ms = json.getJSONArray("milestones")
+                        for (i in 0 until ms.length()) {
+                            val m = ms.getJSONObject(i)
+                            milestones.add(Milestone(m.optInt("index", 0), m.optString("address", "")))
+                        }
+                    }
+                    updateStatusDisplay()
                 }
                 "nav_control" -> {
                     when (json.optString("cmd")) {
                         "start" -> { currentWpIndex = 0; navRunningLocal = true }
-                        "stop" -> { navRunningLocal = false; sendDriveToRobot(0, 0) }
+                        "stop" -> {
+                            navRunningLocal = false
+                            sendDriveToRobot(0, 0)
+                            currentTargetAddress = ""
+                            updateStatusDisplay()
+                        }
                     }
                     localServer?.sendToRobot(json) // ESP32 должна знать, что автопилот включён/выключен
                 }
@@ -490,6 +515,13 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
     private fun navTick() {
         val drive = obstacleOverride() ?: computeWaypointDrive()
         sendDriveToRobot(drive.first, drive.second)
+
+        val addr = milestones.firstOrNull { it.index >= currentWpIndex }?.address
+            ?: milestones.lastOrNull()?.address ?: ""
+        if (addr != currentTargetAddress) {
+            currentTargetAddress = addr
+            updateStatusDisplay()
+        }
     }
 
     private fun obstacleOverride(): Pair<Int, Int>? {
