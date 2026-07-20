@@ -444,12 +444,24 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
                 connectionStatus = "ОШИБКА СОЕДИНЕНИЯ С RENDER: ${t.message}"
                 updateStatusDisplay()
                 updateNotification("Ошибка соединения")
+                scheduleReconnect(host)
             }
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                connectionStatus = "Соединение с Render закрыто (код $code)"
+                connectionStatus = "Соединение с Render закрыто (код $code) — переподключаюсь..."
                 updateStatusDisplay()
+                scheduleReconnect(host)
             }
         })
+    }
+
+    /** Без этого при обрыве связи (Render перезапустился, сеть моргнула) телефон
+     *  просто замолкал навсегда — теперь пробует переподключиться сам, пока сервис жив. */
+    private fun scheduleReconnect(host: String) {
+        if (!running) return // уже остановлены пользователем — не лезем
+        lifecycleScope.launch {
+            delay(5000)
+            if (running) connectToRender(host)
+        }
     }
 
     private fun handleOperatorMessage(text: String) {
