@@ -212,9 +212,15 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
         updateStatusDisplay()
     }
 
-    /** IP телефона в текущей Wi-Fi сети — это и есть адрес, который нужно прописать в прошивку ESP32. */
+    /** IP телефона в сети его точки доступа — именно на него должна стучаться ESP32.
+     *  Раньше эта функция брала первый попавшийся IPv4-адрес с любого интерфейса
+     *  (включая мобильный интернет) — из-за этого показывался неправильный IP.
+     *  Теперь ищем именно интерфейс точки доступа (обычно "ap0"/"swlan0" на Android),
+     *  и только если не нашли — показываем ВСЕ найденные адреса, чтобы можно было
+     *  сверить руками с тем, что видно в настройках точки доступа. */
     private fun getLocalIpAddress(): String? {
         try {
+            val candidates = mutableListOf<Pair<String, String>>() // (имя интерфейса, ip)
             val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
             while (interfaces.hasMoreElements()) {
                 val iface = interfaces.nextElement()
@@ -222,9 +228,20 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
                 while (addresses.hasMoreElements()) {
                     val addr = addresses.nextElement()
                     if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
-                        return addr.hostAddress
+                        candidates.add(iface.name to (addr.hostAddress ?: continue))
                     }
                 }
+            }
+            // Точка доступа Android обычно называется ap0, swlan0 или похоже — ищем в первую очередь её.
+            val apMatch = candidates.firstOrNull {
+                it.first.contains("ap", ignoreCase = true) || it.first.contains("swlan", ignoreCase = true)
+            }
+            if (apMatch != null) return apMatch.second
+
+            // Не нашли явный AP-интерфейс — покажем все варианты, чтобы можно было сверить руками.
+            if (candidates.isNotEmpty()) {
+                return candidates.joinToString(" / ") { "${it.first}:${it.second}" } +
+                    " (не удалось точно определить точку доступа — сверь с настройками)"
             }
         } catch (_: Exception) { }
         return null
