@@ -32,6 +32,7 @@ class MainActivity : AppCompatActivity() {
 
     private val requiredPermissions = mutableListOf(
         Manifest.permission.CAMERA,
+        Manifest.permission.RECORD_AUDIO,
         Manifest.permission.ACCESS_FINE_LOCATION,
         Manifest.permission.ACCESS_COARSE_LOCATION,
     ).apply {
