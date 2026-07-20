@@ -9,6 +9,11 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder
 import android.os.Build
 import android.os.Looper
 import android.util.Base64
@@ -64,6 +69,7 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
         const val NOTIF_ID = 1
         const val LOCAL_WS_PORT = 8080
         const val DISCOVERY_PORT = 8888 // сюда телефон шлёт широковещательные "я тут" пакеты для ESP32
+        const val AUDIO_SAMPLE_RATE = 16000 // хватает для голоса, не гоняет лишний трафик
 
         const val WP_ARRIVE_M = 3.0
         const val MIN_BEARING_DIST = 8.0
@@ -93,6 +99,8 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
     private var navJob: Job? = null
     private var discoveryJob: Job? = null
     private var discoverySocket: DatagramSocket? = null
+    private var audioRecord: AudioRecord? = null
+    private var micJob: Job? = null
 
     private val waypoints = mutableListOf<Pair<Double, Double>>()
     private var currentWpIndex = 0
@@ -194,6 +202,8 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
         discoveryJob = null
         discoverySocket?.close()
         discoverySocket = null
+        stopMicStreaming()
+        stopPlaybackTrack()
         sendDriveToRobot(0, 0)
         remoteSocket?.close(1000, "stopped by user")
         remoteSocket = null
@@ -292,6 +302,104 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
         }
     }
 
+    // ───────────────────────── Микрофон телефона -> оператору (постоянно, как видео) ─────────────────────────
+    @Suppress("MissingPermission")
+    private fun startMicStreaming() {
+        val minBuf = AudioRecord.getMinBufferSize(
+            AUDIO_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBuf <= 0) return
+        val record = try {
+            AudioRecord(
+                MediaRecorder.AudioSource.MIC, AUDIO_SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf * 2
+            )
+        } catch (e: Exception) { return }
+        if (record.state != AudioRecord.STATE_INITIALIZED) return
+
+        audioRecord = record
+        record.startRecording()
+
+        micJob = lifecycleScope.launch(Dispatchers.IO) {
+            val shortBuf = ShortArray(3200) // ~200 мс при 16кГц — компромисс между задержкой и накладными расходами
+            val byteBuf = ByteArray(shortBuf.size * 2)
+            while (isActive) {
+                val n = record.read(shortBuf, 0, shortBuf.size)
+                if (n > 0) {
+                    for (i in 0 until n) {
+                        val v = shortBuf[i].toInt()
+                        byteBuf[i * 2] = (v and 0xFF).toByte()
+                        byteBuf[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+                    }
+                    val b64 = Base64.encodeToString(byteBuf, 0, n * 2, Base64.NO_WRAP)
+                    val msg = JSONObject()
+                        .put("type", "audio_frame")
+                        .put("data", b64)
+                        .put("sampleRate", AUDIO_SAMPLE_RATE)
+                    remoteSocket?.send(msg.toString())
+                }
+            }
+        }
+    }
+
+    private fun stopMicStreaming() {
+        micJob?.cancel()
+        micJob = null
+        audioRecord?.let {
+            try { it.stop(); it.release() } catch (_: Exception) { }
+        }
+        audioRecord = null
+    }
+
+    // ───────────────────────── Голос оператора -> динамик телефона (вживую, не запись) ─────────────────────────
+    private var playbackTrack: AudioTrack? = null
+    private var playbackSampleRate: Int = 0
+
+    private fun ensurePlaybackTrack(sampleRate: Int) {
+        if (playbackTrack != null && playbackSampleRate == sampleRate) return
+        playbackTrack?.let { try { it.stop(); it.release() } catch (_: Exception) { } }
+        val minBuf = AudioTrack.getMinBufferSize(
+            sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .build()
+            )
+            .setBufferSizeInBytes(minBuf * 2)
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
+        track.play()
+        playbackTrack = track
+        playbackSampleRate = sampleRate
+    }
+
+    /** Оператор выключил "говорить" — останавливаем и освобождаем немедленно, робот должен замолчать сразу. */
+    private fun stopPlaybackTrack() {
+        playbackTrack?.let {
+            try { it.pause(); it.flush(); it.stop(); it.release() } catch (_: Exception) { }
+        }
+        playbackTrack = null
+        playbackSampleRate = 0
+    }
+
+    private fun playOperatorAudioChunk(base64Data: String, sampleRate: Int) {
+        try {
+            val bytes = Base64.decode(base64Data, Base64.NO_WRAP)
+            ensurePlaybackTrack(sampleRate)
+            playbackTrack?.write(bytes, 0, bytes.size)
+        } catch (_: Exception) { /* один потерянный чанк не критичен */ }
+    }
+
     private fun sendDriveToRobot(left: Int, right: Int) {
         val msg = JSONObject().put("type", "phone_drive").put("left", left).put("right", right)
         localServer?.sendToRobot(msg)
@@ -345,6 +453,21 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
                     localServer?.sendToRobot(json) // ESP32 должна знать, что автопилот включён/выключен
                 }
                 "gimbal" -> localServer?.sendToRobot(json) // прокидываем ESP32 напрямую локально
+                "listen_control" -> {
+                    // Оператор включает/выключает "слушать робота" — экономим трафик,
+                    // когда никто не слушает, микрофон вообще не стримит.
+                    if (json.optBoolean("enabled", false)) startMicStreaming() else stopMicStreaming()
+                }
+                "talk_control" -> {
+                    // Оператор выключил "говорить" — робот должен замолчать сразу же.
+                    if (!json.optBoolean("enabled", false)) stopPlaybackTrack()
+                }
+                "operator_audio_chunk" -> {
+                    // Живой звук от оператора, не запись — проигрываем сразу по мере поступления.
+                    val b64 = json.optString("data")
+                    val sr = json.optInt("sampleRate", AUDIO_SAMPLE_RATE)
+                    if (b64.isNotEmpty()) playOperatorAudioChunk(b64, sr)
+                }
             }
         } catch (_: Exception) { }
     }
