@@ -80,6 +80,13 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
 
         const val OBST_STOP_M = 0.5f
         const val OBST_SIDE_M = 0.35f
+
+        // ── Осмотреться по сторонам — только когда реально застряли ──
+        const val STUCK_TIMEOUT_MS = 8000L   // столько без прогресса к точке — считаем, что застряли
+        const val GIMBAL_SETTLE_MS = 1200L   // дать камере физически довернуться и стабилизироваться
+        const val PAN_LEFT = 30
+        const val PAN_CENTER = 90
+        const val PAN_RIGHT = 150
     }
 
     // ── Наружу, в Render (оператор) ──
@@ -106,6 +113,9 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
     private val milestones = mutableListOf<Milestone>()
     private var currentWpIndex = 0
     private var navRunningLocal = false
+    private var scanning = false
+    private var lastProgressDist = Double.MAX_VALUE
+    private var lastProgressAt = 0L
     private var connectionStatus = "Подключение..."
     private var localServerInfo = ""
     private var lastGpsText = ""
@@ -467,7 +477,12 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
                 }
                 "nav_control" -> {
                     when (json.optString("cmd")) {
-                        "start" -> { currentWpIndex = 0; navRunningLocal = true }
+                        "start" -> {
+                            currentWpIndex = 0
+                            navRunningLocal = true
+                            lastProgressDist = Double.MAX_VALUE
+                            lastProgressAt = System.currentTimeMillis()
+                        }
                         "stop" -> {
                             navRunningLocal = false
                             sendDriveToRobot(0, 0)
@@ -513,6 +528,15 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
     }
 
     private fun navTick() {
+        if (scanning) return // сейчас крутим гимбалом и смотрим по сторонам — обычная логика на паузе
+
+        val o = ArCoreBridge.obstacles.value
+        val boxedIn = o.center <= OBST_STOP_M && o.left <= OBST_SIDE_M && o.right <= OBST_SIDE_M
+        if (boxedIn) {
+            triggerLookAroundScan()
+            return
+        }
+
         val drive = obstacleOverride() ?: computeWaypointDrive()
         sendDriveToRobot(drive.first, drive.second)
 
@@ -524,16 +548,74 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
         }
     }
 
+    /**
+     * Полноценный "осмотрелся — принял решение". Не используется на каждом препятствии —
+     * только когда реально застряли: либо зажаты со всех сторон сразу, либо долго нет
+     * прогресса к точке несмотря на попытки объехать. Останавливаемся, физически
+     * поворачиваем камеру влево/вправо гимбалом, даём ей стабилизироваться, смотрим
+     * глубину в каждом направлении и уже осознанно выбираем, куда повернуть.
+     */
+    private fun triggerLookAroundScan() {
+        if (scanning) return
+        scanning = true
+        RobotBrainState.status.value = "Застряли — осматриваюсь по сторонам..."
+        lifecycleScope.launch {
+            try {
+                sendDriveToRobot(0, 0)
+
+                localServer?.sendToRobot(gimbalCmd(PAN_LEFT))
+                delay(GIMBAL_SETTLE_MS)
+                val leftClear = ArCoreBridge.obstacles.value.center
+
+                localServer?.sendToRobot(gimbalCmd(PAN_RIGHT))
+                delay(GIMBAL_SETTLE_MS)
+                val rightClear = ArCoreBridge.obstacles.value.center
+
+                localServer?.sendToRobot(gimbalCmd(PAN_CENTER))
+                delay(GIMBAL_SETTLE_MS)
+
+                when {
+                    leftClear <= OBST_SIDE_M && rightClear <= OBST_SIDE_M -> {
+                        // и слева, и справа плохо — единственный вариант, короткий реверс
+                        sendDriveToRobot(-NAV_SPEED_MIN, -NAV_SPEED_MIN)
+                        delay(800)
+                    }
+                    leftClear > rightClear -> {
+                        sendDriveToRobot(-NAV_SPEED_MIN, NAV_SPEED_MIN) // слева свободнее
+                        delay(1000)
+                    }
+                    else -> {
+                        sendDriveToRobot(NAV_SPEED_MIN, -NAV_SPEED_MIN) // справа свободнее
+                        delay(1000)
+                    }
+                }
+                sendDriveToRobot(0, 0)
+            } finally {
+                lastProgressAt = System.currentTimeMillis() // даём себе фору перед следующей проверкой
+                scanning = false
+                updateStatusDisplay()
+            }
+        }
+    }
+
+    private fun gimbalCmd(pan: Int) = JSONObject()
+        .put("type", "gimbal")
+        .put("pan", pan)
+        .put("tilt", 90)
+        .put("roll", 90)
+
     private fun obstacleOverride(): Pair<Int, Int>? {
         val o = ArCoreBridge.obstacles.value
         if (o.center > OBST_STOP_M && o.left > OBST_SIDE_M && o.right > OBST_SIDE_M) return null
 
+        // Зажаты со всех сторон одновременно обрабатывает navTick() запуском осмотра —
+        // сюда мы попадаем только когда есть хоть одна свободная сторона.
         if (o.center <= OBST_STOP_M) {
             return if (o.left > OBST_SIDE_M || o.right > OBST_SIDE_M) {
                 if (o.left > o.right) (-NAV_SPEED_MIN) to NAV_SPEED_MIN
                 else NAV_SPEED_MIN to (-NAV_SPEED_MIN)
             } else {
-                (-NAV_SPEED_MIN) to (-NAV_SPEED_MIN)
+                null // сюда не дойдём (зажатость поймал navTick раньше), но на всякий случай
             }
         }
         if (o.left <= OBST_SIDE_M) return steerSpeeds(NAV_SPEED_MIN + 20, 20.0)
@@ -557,6 +639,19 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
             }
             target = waypoints[currentWpIndex]
             dist = gpsDistM(loc.first, loc.second, target.first, target.second)
+            lastProgressDist = Double.MAX_VALUE
+            lastProgressAt = System.currentTimeMillis()
+        }
+
+        // Нет прогресса к точке уже долго, несмотря на попытки объехать — не просто
+        // "препятствие прямо сейчас", а реально застряли где-то. Осматриваемся по сторонам.
+        val now = System.currentTimeMillis()
+        if (dist < lastProgressDist - 0.5) {
+            lastProgressDist = dist
+            lastProgressAt = now
+        } else if (now - lastProgressAt > STUCK_TIMEOUT_MS) {
+            triggerLookAroundScan()
+            return 0 to 0
         }
 
         val heading = lastHeading
