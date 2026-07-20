@@ -92,6 +92,7 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
     private var running = false
     private var navJob: Job? = null
     private var discoveryJob: Job? = null
+    private var discoverySocket: DatagramSocket? = null
 
     private val waypoints = mutableListOf<Pair<Double, Double>>()
     private var currentWpIndex = 0
@@ -191,6 +192,8 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
         navJob = null
         discoveryJob?.cancel()
         discoveryJob = null
+        discoverySocket?.close()
+        discoverySocket = null
         sendDriveToRobot(0, 0)
         remoteSocket?.close(1000, "stopped by user")
         remoteSocket = null
@@ -218,7 +221,7 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
         val ip = getLocalIpAddress() ?: "не найден — проверь Wi-Fi"
         localServerInfo = "ESP32 подключается на: $ip:$LOCAL_WS_PORT"
         updateStatusDisplay()
-        startDiscoveryBroadcast()
+        startDiscoveryListener()
     }
 
     /** IP телефона в сети его точки доступа — именно на него должна стучаться ESP32.
@@ -257,26 +260,35 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
     }
 
     /**
-     * IP телефона в сети точки доступа может меняться от раза к разу (Android сам
-     * решает, какой адрес выдать) — поэтому вместо того чтобы вписывать его руками
-     * в прошивку ESP32, телефон сам постоянно "кричит" в сеть широковещательным
-     * UDP-пакетом "я тут, порт такой-то". ESP32 слушает эти объявления и сама
-     * узнаёт актуальный адрес — заводить IP в коде прошивки больше не нужно.
+     * IP телефона в сети точки доступа может меняться от раза к разу, а широковещательные
+     * пакеты ОТ хоста (телефона) К подключённым устройствам многие реализации Android
+     * не пропускают вообще. Поэтому вместо "телефон кричит в сеть" — наоборот: ESP32
+     * сама рассылает broadcast "я тут", а телефон его слушает и отвечает ей ЛИЧНО
+     * (unicast, не broadcast) — от хоста к своему клиенту unicast всегда доходит,
+     * иначе не работал бы даже раздаваемый интернет.
      */
-    private fun startDiscoveryBroadcast() {
+    private fun startDiscoveryListener() {
         discoveryJob?.cancel()
         discoveryJob = lifecycleScope.launch(Dispatchers.IO) {
-            val message = "ROBOT_BRAIN:$LOCAL_WS_PORT".toByteArray()
-            val broadcastAddr = InetAddress.getByName("255.255.255.255")
-            while (isActive) {
-                try {
-                    DatagramSocket().use { socket ->
-                        socket.broadcast = true
-                        socket.send(DatagramPacket(message, message.size, broadcastAddr, DISCOVERY_PORT))
+            try {
+                val socket = DatagramSocket(DISCOVERY_PORT)
+                socket.broadcast = true
+                discoverySocket = socket
+                val buf = ByteArray(64)
+                while (isActive) {
+                    val packet = DatagramPacket(buf, buf.size)
+                    try {
+                        socket.receive(packet) // блокирующий вызов, разбудит socket.close() при остановке
+                        val text = String(packet.data, 0, packet.length)
+                        if (text.startsWith("ESP32_HELLO")) {
+                            val reply = "PHONE_HERE:$LOCAL_WS_PORT".toByteArray()
+                            socket.send(DatagramPacket(reply, reply.size, packet.address, packet.port))
+                        }
+                    } catch (e: Exception) {
+                        if (!isActive) break
                     }
-                } catch (_: Exception) { /* сеть могла на секунду моргнуть — не критично, попробуем снова */ }
-                delay(2000)
-            }
+                }
+            } catch (_: Exception) { }
         }
     }
 
