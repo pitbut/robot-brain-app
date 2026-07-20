@@ -21,6 +21,7 @@ import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -31,6 +32,9 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.atan2
@@ -59,6 +63,7 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
         const val CHANNEL_ID = "robot_brain_channel"
         const val NOTIF_ID = 1
         const val LOCAL_WS_PORT = 8080
+        const val DISCOVERY_PORT = 8888 // сюда телефон шлёт широковещательные "я тут" пакеты для ESP32
 
         const val WP_ARRIVE_M = 3.0
         const val MIN_BEARING_DIST = 8.0
@@ -86,6 +91,7 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
     private var lastLocation: Pair<Double, Double>? = null
     private var running = false
     private var navJob: Job? = null
+    private var discoveryJob: Job? = null
 
     private val waypoints = mutableListOf<Pair<Double, Double>>()
     private var currentWpIndex = 0
@@ -183,6 +189,8 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
         running = false
         navJob?.cancel()
         navJob = null
+        discoveryJob?.cancel()
+        discoveryJob = null
         sendDriveToRobot(0, 0)
         remoteSocket?.close(1000, "stopped by user")
         remoteSocket = null
@@ -210,6 +218,7 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
         val ip = getLocalIpAddress() ?: "не найден — проверь Wi-Fi"
         localServerInfo = "ESP32 подключается на: $ip:$LOCAL_WS_PORT"
         updateStatusDisplay()
+        startDiscoveryBroadcast()
     }
 
     /** IP телефона в сети его точки доступа — именно на него должна стучаться ESP32.
@@ -245,6 +254,30 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
             }
         } catch (_: Exception) { }
         return null
+    }
+
+    /**
+     * IP телефона в сети точки доступа может меняться от раза к разу (Android сам
+     * решает, какой адрес выдать) — поэтому вместо того чтобы вписывать его руками
+     * в прошивку ESP32, телефон сам постоянно "кричит" в сеть широковещательным
+     * UDP-пакетом "я тут, порт такой-то". ESP32 слушает эти объявления и сама
+     * узнаёт актуальный адрес — заводить IP в коде прошивки больше не нужно.
+     */
+    private fun startDiscoveryBroadcast() {
+        discoveryJob?.cancel()
+        discoveryJob = lifecycleScope.launch(Dispatchers.IO) {
+            val message = "ROBOT_BRAIN:$LOCAL_WS_PORT".toByteArray()
+            val broadcastAddr = InetAddress.getByName("255.255.255.255")
+            while (isActive) {
+                try {
+                    DatagramSocket().use { socket ->
+                        socket.broadcast = true
+                        socket.send(DatagramPacket(message, message.size, broadcastAddr, DISCOVERY_PORT))
+                    }
+                } catch (_: Exception) { /* сеть могла на секунду моргнуть — не критично, попробуем снова */ }
+                delay(2000)
+            }
+        }
     }
 
     private fun sendDriveToRobot(left: Int, right: Int) {
@@ -297,6 +330,7 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
                         "start" -> { currentWpIndex = 0; navRunningLocal = true }
                         "stop" -> { navRunningLocal = false; sendDriveToRobot(0, 0) }
                     }
+                    localServer?.sendToRobot(json) // ESP32 должна знать, что автопилот включён/выключен
                 }
                 "gimbal" -> localServer?.sendToRobot(json) // прокидываем ESP32 напрямую локально
             }
