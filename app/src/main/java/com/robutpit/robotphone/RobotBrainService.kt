@@ -120,7 +120,7 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
     private var localServerInfo = ""
     private var lastGpsText = ""
     private var currentTargetAddress = ""
-    private var lastEspLogLine = ""
+    private val espLogLines = ArrayDeque<String>()
 
     private data class Milestone(val index: Int, val address: String)
 
@@ -133,7 +133,7 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
             connectionStatus,
             localServerInfo.takeIf { it.isNotEmpty() },
             currentTargetAddress.takeIf { it.isNotEmpty() }?.let { "Едет к: $it" },
-            lastEspLogLine.takeIf { it.isNotEmpty() }?.let { "ESP32: $it" },
+            espLogLines.takeIf { it.isNotEmpty() }?.let { "ESP32:\n" + it.joinToString("\n") },
             milestonesText,
             lastGpsText.takeIf { it.isNotEmpty() },
         )
@@ -249,7 +249,8 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
             onOperatorMessage = { /* оператор сюда не подключается напрямую */ },
             onRobotMessage = { statusJson -> remoteSocket?.send(statusJson.toString()) },
             onLog = { line ->
-                lastEspLogLine = line
+                espLogLines.addLast(line)
+                while (espLogLines.size > 6) espLogLines.removeFirst()
                 updateStatusDisplay()
             },
         )
