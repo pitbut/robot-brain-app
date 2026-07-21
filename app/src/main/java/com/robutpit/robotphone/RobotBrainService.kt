@@ -120,6 +120,7 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
     private var localServerInfo = ""
     private var lastGpsText = ""
     private var currentTargetAddress = ""
+    private var lastEspLogLine = ""
 
     private data class Milestone(val index: Int, val address: String)
 
@@ -132,6 +133,7 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
             connectionStatus,
             localServerInfo.takeIf { it.isNotEmpty() },
             currentTargetAddress.takeIf { it.isNotEmpty() }?.let { "Едет к: $it" },
+            lastEspLogLine.takeIf { it.isNotEmpty() }?.let { "ESP32: $it" },
             milestonesText,
             lastGpsText.takeIf { it.isNotEmpty() },
         )
@@ -246,6 +248,10 @@ class RobotBrainService : LifecycleService(), SensorEventListener {
             LOCAL_WS_PORT,
             onOperatorMessage = { /* оператор сюда не подключается напрямую */ },
             onRobotMessage = { statusJson -> remoteSocket?.send(statusJson.toString()) },
+            onLog = { line ->
+                lastEspLogLine = line
+                updateStatusDisplay()
+            },
         )
         localServer?.start()
         val ip = getLocalIpAddress() ?: "не найден — проверь Wi-Fi"
