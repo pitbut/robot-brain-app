@@ -18,6 +18,7 @@ class RobotWsServer(
     port: Int,
     private val onOperatorMessage: (JSONObject) -> Unit,
     private val onRobotMessage: (JSONObject) -> Unit,
+    private val onLog: (String) -> Unit = {},
 ) : WebSocketServer(InetSocketAddress(port)) {
 
     private val operatorConns = Collections.synchronizedSet(mutableSetOf<WebSocket>())
@@ -25,17 +26,22 @@ class RobotWsServer(
     private val roleOf = Collections.synchronizedMap(mutableMapOf<WebSocket, String>())
 
     override fun onOpen(conn: WebSocket, handshake: ClientHandshake) {
-        // роль клиент пришлёт первым сообщением {"type":"hello","role":"operator"/"robot"}
+        onLog("onOpen: TCP+WS хендшейк успешен от ${conn.remoteSocketAddress}")
     }
 
     override fun onMessage(conn: WebSocket, message: String) {
-        val json = try { JSONObject(message) } catch (e: Exception) { return }
+        onLog("onMessage от ${conn.remoteSocketAddress}: $message")
+        val json = try { JSONObject(message) } catch (e: Exception) {
+            onLog("onMessage: не распарсился JSON — ${e.message}")
+            return
+        }
         when (json.optString("type")) {
             "hello" -> {
                 val role = json.optString("role")
                 roleOf[conn] = role
                 if (role == "operator") operatorConns.add(conn)
                 if (role == "robot") robotConns.add(conn)
+                onLog("hello принят, роль=$role")
             }
             // Всё остальное от оператора (маршрут, старт/стоп, гимбал, ручное управление)
             // обрабатывается логикой навигации в сервисе — просто прокидываем выше.
@@ -49,14 +55,19 @@ class RobotWsServer(
     }
 
     override fun onClose(conn: WebSocket, code: Int, reason: String, remote: Boolean) {
+        onLog("onClose: код=$code причина='$reason' remote=$remote")
         operatorConns.remove(conn)
         robotConns.remove(conn)
         roleOf.remove(conn)
     }
 
-    override fun onError(conn: WebSocket?, ex: Exception) { /* соединение просто отвалится, ESP32 переподключится сама */ }
+    override fun onError(conn: WebSocket?, ex: Exception) {
+        onLog("onError: ${ex.javaClass.simpleName}: ${ex.message}")
+    }
 
-    override fun onStart() { /* сервер поднят и слушает */ }
+    override fun onStart() {
+        onLog("Локальный сервер запущен и слушает порт")
+    }
 
     /** Команда на моторы — единственное, что реально нужно ESP32. */
     fun sendToRobot(json: JSONObject) {
